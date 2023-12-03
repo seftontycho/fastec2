@@ -9,6 +9,7 @@ from pkg_resources import resource_filename
 from pdb import set_trace
 from .spot import *
 from .scripts import *
+import tqdm
 
 __all__ = "EC2 result results snake2camel make_filter listify".split()
 
@@ -51,7 +52,7 @@ def _boto3_repr(self):
             for o in self.block_device_mappings
             if self.root_device_name == o["DeviceName"]
         ]
-        return f'{self.name} ({self.id} {self.state}): {root_dev[0]["Ebs"]["VolumeSize"]}GB'
+        return f'{self.name} ({self.id} {self.state}): {root_dev[0]["Ebs"]}'
     else:
         identifiers = [
             f"{ident}={repr(getattr(self, ident))}" for ident in self.meta.identifiers
@@ -402,12 +403,32 @@ class EC2:
             name = inst.name
         amiid = self._ec2.create_image(InstanceId=inst.id, Name=name)["ImageId"]
         ami = self.get_ami(amiid)
-        snid = ami.block_device_mappings[0]["Ebs"]["SnapshotId"]
-        self.create_name(snid, name)
+
+        print('Waiting for image to be "available"...')
+        self.waitfor("image", "available", ami.id, timeout=600)
+
+        print(f"{ami=}")
+        a = ami.block_device_mappings
+        print(a)
+        snid = a[0]["Ebs"].get("SnapshotId")
+        if snid is not None:
+            self.create_name(snid, name)
+
         return ami
 
-    def _launch_spec(self, ami, keyname, disksize, instancetype, secgroupid, iops=None):
-        assert self._describe("key_pairs", {"key-name": keyname}), "key not found"
+    def _launch_spec(
+        self,
+        ami,
+        keyname,
+        disksize,
+        instancetype,
+        secgroupid,
+        az: str = "us-east-1a",
+        iops=None,
+    ):
+        assert self._describe(
+            "key_pairs", {"key-name": keyname}
+        ), f"key for {keyname=}not found"
         ami = self.get_ami(ami)
         ebs = (
             {"VolumeSize": disksize, "VolumeType": "io1", "Iops": iops}
@@ -609,7 +630,7 @@ class EC2:
         "Stops instance `inst`"
         self.get_instance(inst).stop()
 
-    def connect(self, inst, idx=00, ports=None, user=None, keyfile="~/.ssh/id_rsa"):
+    def connect(self, inst, ports=None, user=None, keyfile="~/.ssh/id_rsa"):
         """Replace python process with an ssh process connected to instance `inst`;
         use `user@name` otherwise defaults to user 'ubuntu'. `ports` (int or list) creates tunnels
         """
@@ -618,14 +639,18 @@ class EC2:
                 user, inst = inst.split("@")
             else:
                 user = "ubuntu"
-
         inst = self.get_instance(inst)
-
-        os.system(
-            "autossh -M 0 "
-            + f"{user}@{inst.public_dns_name} "
-            + "-t tmux -CC new -A -s "
-            + f"{idx}"
+        # tunnel = []
+        tunnel = [f"-L {o}:localhost:{o}" for o in listify(ports)]
+        os.execvp(
+            "ssh",
+            [
+                "ssh",
+                f"{user}@{inst.public_ip_address}",
+                "-i",
+                os.path.expanduser(keyfile),
+                *tunnel,
+            ],
         )
 
     def sshs(self, inst, user="ubuntu", keyfile="~/.ssh/id_rsa"):
@@ -638,7 +663,13 @@ class EC2:
         "Return a paramiko ssh connection objected connected to instance `inst`"
         inst = self.get_instance(inst)
         keyfile = os.path.expanduser(keyfile)
-        key = paramiko.RSAKey.from_private_key_file(keyfile)
+        try:
+            key = paramiko.RSAKey.from_private_key_file(keyfile)
+        except paramiko.SSHException as e:
+            print(f'Failed to load key "{keyfile}": {e}')
+            print(f"Trying to parse as ED25519")
+            key = paramiko.Ed25519Key.from_private_key_file(keyfile)
+
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(hostname=inst.public_ip_address, username=user, pkey=key)

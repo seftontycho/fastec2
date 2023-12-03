@@ -38,5 +38,6 @@ setup(
         "pandas",
         "paramiko",
         "pysftp",
+        "tqdm",
     ],
 )
